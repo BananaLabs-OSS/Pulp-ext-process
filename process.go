@@ -312,10 +312,16 @@ func (p *procPool) runCommand(parent context.Context, req runRequest) runResult 
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
-	// Suppress a console window for the child (no-op off Windows). The host bundle is
-	// linked GUI-subsystem, so without this each console child (go build, git, ctl reload,
-	// the desktop helper) would FLASH its own console window.
-	cmd.SysProcAttr = noWindowAttr()
+	// Per-OS spawn attributes: suppress a console window (Windows GUI bundle would else
+	// FLASH one per child), and group the child so its WHOLE tree is killable — a Windows
+	// Job Object / a Unix process group. Without this, ctx-cancel kills only the direct
+	// child and grandchildren (git's git-remote-https, a shell's children) orphan and lock
+	// the toolchain dir.
+	cmd.SysProcAttr = childSysProcAttr()
+	// On timeout/cancel/teardown, kill the whole tree, not just the leader; cap the wait so
+	// a wedged process can't block Wait() forever after we've signalled it.
+	cmd.Cancel = func() error { return killProcessTree(cmd) }
+	cmd.WaitDelay = 5 * time.Second
 	if req.Dir != "" {
 		cmd.Dir = req.Dir
 	}
@@ -334,7 +340,14 @@ func (p *procPool) runCommand(parent context.Context, req runRequest) runResult 
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	// Start/Wait (not Run) so we can enroll the child in its kill-group between the two —
+	// on Windows the Job Object is assigned to the live process before it can spawn much.
+	if err := cmd.Start(); err != nil {
+		return runResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), Error: err.Error(), ExitCode: -1}
+	}
+	superviseProcess(cmd.Process)
+	err := cmd.Wait()
+	releaseJob(cmd.Process) // free the job handle now the child has exited (no-op off Windows)
 	res := runResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
 	if cmd.ProcessState != nil {
 		res.ExitCode = cmd.ProcessState.ExitCode()
