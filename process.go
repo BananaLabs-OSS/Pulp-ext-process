@@ -17,7 +17,7 @@
 //	process_run(req_ptr, req_len) -> task_id_or_code   # submit; id>=100 on success
 //	process_result(task_id, out_ptr_out, out_len_out) -> status  # consume-once: returns statusUnknown on repeat read
 //	process_cancel(task_id) -> code
-//	process_pending() -> count  # NOTE: global count (all cells), not scoped to the calling cell
+//	process_pending() -> count  # per-cell inflight count for the calling cell
 //
 // The run model is async (submit → poll → cancel), mirroring Pulp-ext-workers,
 // because a build can take seconds and the cell-side host import must not block
@@ -136,6 +136,9 @@ type procPool struct {
 	logger         *slog.Logger
 	maxOutputBytes int
 
+	allowBins  map[string]struct{}
+	allowRoots []string
+
 	sem       chan struct{}
 	maxQueued int
 
@@ -158,6 +161,8 @@ func newProcPool(logger *slog.Logger, maxConcurrency, maxQueued, maxPerCell, max
 	p := &procPool{
 		logger:         logger,
 		maxOutputBytes: maxOutputBytes,
+		allowBins:      allowedBins(),
+		allowRoots:     allowedRoots(),
 		sem:            make(chan struct{}, maxConcurrency),
 		maxQueued:      maxQueued,
 		cellCount:      map[string]int{},
@@ -212,11 +217,11 @@ func (p *procPool) submit(cellID string, req runRequest) (uint32, uint32) {
 	}
 	// Guard BEFORE reserving any slot — a denied command never consumes quota.
 	resolved, _ := exec.LookPath(req.Argv[0])
-	if err := validateBin(req.Argv[0], resolved, allowedBins()); err != nil {
+	if err := validateBin(req.Argv[0], resolved, p.allowBins); err != nil {
 		p.logger.Warn("spawn.process: binary denied", "cell", cellID, "argv0", req.Argv[0], "err", err)
 		return 0, codeBinDenied
 	}
-	if err := validateDir(req.Dir, allowedRoots()); err != nil {
+	if err := validateDir(req.Dir, p.allowRoots); err != nil {
 		p.logger.Warn("spawn.process: dir denied", "cell", cellID, "dir", req.Dir, "err", err)
 		return 0, codeDirDenied
 	}
@@ -402,8 +407,10 @@ func (p *procPool) cancel(cellID string, id uint32) uint32 {
 	return 0
 }
 
-func (p *procPool) pending() uint32 {
-	return uint32(p.inflightCount())
+func (p *procPool) pendingCell(cellID string) uint32 {
+	p.cellsMu.Lock()
+	defer p.cellsMu.Unlock()
+	return uint32(p.cellCount[cellID])
 }
 
 func (p *procPool) cleanupLoop(ctx context.Context) {
@@ -510,6 +517,9 @@ func setup(env ext.SetupEnv) error {
 		readIntEnv("PROCESS_MAX_PER_CELL", defaultMaxPerCell),
 		readIntEnv("PROCESS_MAX_OUTPUT_BYTES", defaultMaxOutputBytes),
 	)
+	if len(pool.allowBins) == 0 {
+		logger.Error("spawn.process: PROCESS_ALLOW_BINS is empty — all commands will be denied")
+	}
 	logger.Info("spawn.process ready",
 		"allow_bins", os.Getenv("PROCESS_ALLOW_BINS"),
 		"run_roots", os.Getenv("PROCESS_RUN_ROOTS"))
@@ -601,7 +611,7 @@ func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	}).Export("process_cancel")
 
 	b.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module) uint32 {
-		return pool.pending()
+		return pool.pendingCell(cellID)
 	}).Export("process_pending")
 
 	return nil
