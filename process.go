@@ -374,6 +374,9 @@ func (p *procPool) runCommand(parent context.Context, req runRequest) runResult 
 	return res
 }
 
+// result peeks at the completed result for id without removing it from the
+// map. The caller must call consume(id) after successfully writing the data
+// into WASM memory so that a failed alloc never silently drops the result.
 func (p *procPool) result(cellID string, id uint32) ([]byte, uint32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -381,7 +384,6 @@ func (p *procPool) result(cellID string, id uint32) ([]byte, uint32) {
 		if r.cellID != cellID {
 			return nil, statusUnknown
 		}
-		delete(p.results, id)
 		return r.data, r.status
 	}
 	if t, ok := p.inflight[id]; ok {
@@ -391,6 +393,15 @@ func (p *procPool) result(cellID string, id uint32) ([]byte, uint32) {
 		return nil, statusPending
 	}
 	return nil, statusUnknown
+}
+
+// consume removes the completed result for id from the map. Must be called
+// only after the WASM memory write succeeds; leaving the result in the map
+// until then lets the cell retry if alloc fails.
+func (p *procPool) consume(id uint32) {
+	p.mu.Lock()
+	delete(p.results, id)
+	p.mu.Unlock()
 }
 
 func (p *procPool) cancel(cellID string, id uint32) uint32 {
@@ -585,22 +596,29 @@ func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			return status
 		}
 		if len(data) == 0 {
+			// Nothing to write; consume before returning so the slot is freed.
+			pool.consume(taskID)
 			m.Memory().WriteUint32Le(outPtrOut, 0)
 			m.Memory().WriteUint32Le(outLenOut, 0)
 			return status
 		}
 		allocFn := m.ExportedFunction("pulp_alloc")
 		if allocFn == nil {
+			// Alloc unavailable; leave result in map so the cell can retry.
 			return status
 		}
 		res, err := allocFn.Call(ctx, uint64(len(data)))
 		if err != nil || len(res) == 0 {
+			// Alloc failed; leave result in map so the cell can retry.
 			return status
 		}
 		ptr := uint32(res[0])
 		if ptr == 0 || !m.Memory().Write(ptr, data) {
+			// Write failed; leave result in map so the cell can retry.
 			return status
 		}
+		// Write succeeded — now safe to consume the result.
+		pool.consume(taskID)
 		m.Memory().WriteUint32Le(outPtrOut, ptr)
 		m.Memory().WriteUint32Le(outLenOut, uint32(len(data)))
 		return status
