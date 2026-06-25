@@ -15,9 +15,9 @@
 // Host imports exposed (all msgpack request/response over linear memory):
 //
 //	process_run(req_ptr, req_len) -> task_id_or_code   # submit; id>=100 on success
-//	process_result(task_id, out_ptr_out, out_len_out) -> status
+//	process_result(task_id, out_ptr_out, out_len_out) -> status  # consume-once: returns statusUnknown on repeat read
 //	process_cancel(task_id) -> code
-//	process_pending() -> count
+//	process_pending() -> count  # NOTE: global count (all cells), not scoped to the calling cell
 //
 // The run model is async (submit → poll → cancel), mirroring Pulp-ext-workers,
 // because a build can take seconds and the cell-side host import must not block
@@ -472,7 +472,9 @@ func (p *procPool) teardownCell(cellID string) int {
 // ---- capped buffer -------------------------------------------------------
 
 // cappedBuffer is an io.Writer that buffers up to limit bytes and silently
-// drops the rest, so unbounded command output cannot OOM the host.
+// drops the rest, so unbounded command output cannot OOM the host. The
+// overflow flag is set when bytes are dropped; it is not currently surfaced
+// in runResult (no truncation indicator reaches the cell).
 type cappedBuffer struct {
 	buf      bytes.Buffer
 	limit    int
