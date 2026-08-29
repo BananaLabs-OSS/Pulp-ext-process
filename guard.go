@@ -53,7 +53,12 @@ func allowedBins() map[string]struct{} {
 // "go", "go.exe", and an absolute "C:\\...\\go.exe" all match an allow entry
 // of "go".
 func binBase(name string) string {
-	b := strings.ToLower(filepath.Base(name))
+	// Accept either path separator regardless of the host running the guard.
+	// filepath.Base only recognizes the current OS separator.
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		name = name[i+1:]
+	}
+	b := strings.ToLower(name)
 	for _, ext := range []string{".exe", ".bat", ".cmd", ".com"} {
 		if strings.HasSuffix(b, ext) {
 			return strings.TrimSuffix(b, ext)
