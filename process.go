@@ -104,10 +104,12 @@ func init() {
 // ---- request / result types ----------------------------------------------
 
 type runRequest struct {
-	Argv      []string          `msgpack:"argv"`
-	Dir       string            `msgpack:"dir,omitempty"`
-	Env       map[string]string `msgpack:"env,omitempty"`
-	TimeoutMs uint32            `msgpack:"timeout_ms,omitempty"`
+	Argv               []string          `msgpack:"argv"`
+	Dir                string            `msgpack:"dir,omitempty"`
+	Env                map[string]string `msgpack:"env,omitempty"`
+	TimeoutMs          uint32            `msgpack:"timeout_ms,omitempty"`
+	hostMaxOutputBytes int               `msgpack:"-"`
+	hostReplaceEnv     bool              `msgpack:"-"`
 }
 
 type runResult struct {
@@ -138,6 +140,8 @@ type procPool struct {
 
 	allowBins  map[string]struct{}
 	allowRoots []string
+	grants     ext.PlacementGrantResolver
+	policies   sync.Map // ext.Scope.RoutingID() -> *scopedProcessPolicy
 
 	sem       chan struct{}
 	maxQueued int
@@ -212,18 +216,36 @@ func (p *procPool) inflightCount() int {
 // submit validates the request, reserves slots, and launches the command in a
 // goroutine. Returns (id, codeOK) or (0, errorCode).
 func (p *procPool) submit(cellID string, req runRequest) (uint32, uint32) {
+	return p.submitPolicy(cellID, req, nil)
+}
+
+func (p *procPool) submitPolicy(cellID string, req runRequest, policy *scopedProcessPolicy) (uint32, uint32) {
 	if len(req.Argv) == 0 || strings.TrimSpace(req.Argv[0]) == "" {
 		return 0, codeInvalidRequest
 	}
 	// Guard BEFORE reserving any slot — a denied command never consumes quota.
 	resolved, _ := exec.LookPath(req.Argv[0])
-	if err := validateBin(req.Argv[0], resolved, p.allowBins); err != nil {
+	if policy != nil {
+		// A scoped guest names its granted working root as "."; only the host
+		// knows and substitutes the canonical path.
+		if strings.TrimSpace(req.Dir) == "." || strings.TrimSpace(req.Dir) == "" {
+			req.Dir = policy.root
+		}
+		if err := policy.validate(req, resolved); err != nil {
+			p.logger.Warn("spawn.process: scoped request denied", "cell", cellID, "err", err)
+			return 0, codeBinDenied
+		}
+		req.hostMaxOutputBytes = policy.maxOutputBytes
+		req.hostReplaceEnv = policy.kind == "fixed-verification"
+	} else if err := validateBin(req.Argv[0], resolved, p.allowBins); err != nil {
 		p.logger.Warn("spawn.process: binary denied", "cell", cellID, "argv0", req.Argv[0], "err", err)
 		return 0, codeBinDenied
 	}
-	if err := validateDir(req.Dir, p.allowRoots); err != nil {
-		p.logger.Warn("spawn.process: dir denied", "cell", cellID, "dir", req.Dir, "err", err)
-		return 0, codeDirDenied
+	if policy == nil {
+		if err := validateDir(req.Dir, p.allowRoots); err != nil {
+			p.logger.Warn("spawn.process: dir denied", "cell", cellID, "dir", req.Dir, "err", err)
+			return 0, codeDirDenied
+		}
 	}
 
 	if p.inflightCount() >= p.maxQueued {
@@ -316,6 +338,9 @@ func (p *procPool) runCommand(parent context.Context, req runRequest) runResult 
 	}
 	defer cancel()
 
+	// #nosec G204 -- process execution is this host capability's purpose. The
+	// manifest-derived cell policy validates the executable before this point,
+	// and argv is passed directly without a command shell.
 	cmd := exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
 	// Per-OS spawn attributes: suppress a console window (Windows GUI bundle would else
 	// FLASH one per child), and group the child so its WHOLE tree is killable — a Windows
@@ -330,9 +355,14 @@ func (p *procPool) runCommand(parent context.Context, req runRequest) runResult 
 	if req.Dir != "" {
 		cmd.Dir = req.Dir
 	}
-	// Overlay the requested env onto the host env so PATH/GOROOT/etc. survive.
-	if len(req.Env) > 0 {
-		env := os.Environ()
+	// Legacy and Git requests overlay their declared variables. A fixed
+	// verification receives only the host-approved environment, preventing
+	// ambient host secrets from silently crossing the capability boundary.
+	if len(req.Env) > 0 || req.hostReplaceEnv {
+		env := []string(nil)
+		if !req.hostReplaceEnv {
+			env = os.Environ()
+		}
 		for k, v := range req.Env {
 			env = append(env, k+"="+v)
 		}
@@ -340,8 +370,12 @@ func (p *procPool) runCommand(parent context.Context, req runRequest) runResult 
 	}
 
 	var stdout, stderr cappedBuffer
-	stdout.limit = p.maxOutputBytes
-	stderr.limit = p.maxOutputBytes
+	limit := p.maxOutputBytes
+	if req.hostMaxOutputBytes > 0 && req.hostMaxOutputBytes < limit {
+		limit = req.hostMaxOutputBytes
+	}
+	stdout.limit = limit
+	stderr.limit = limit
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
@@ -358,6 +392,16 @@ func (p *procPool) runCommand(parent context.Context, req runRequest) runResult 
 		res.ExitCode = cmd.ProcessState.ExitCode()
 	}
 	if err != nil {
+		// CommandContext commonly reports a signal-shaped *exec.ExitError after
+		// killing a timed-out/cancelled child. Preserve the controlling context
+		// cause before treating ordinary non-zero exits as successful execution.
+		if cause := ctx.Err(); cause != nil {
+			res.Error = cause.Error()
+			if res.ExitCode == 0 {
+				res.ExitCode = -1
+			}
+			return res
+		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			// Non-zero exit is a normal result, not a transport error: the
@@ -528,6 +572,7 @@ func setup(env ext.SetupEnv) error {
 		readIntEnv("PROCESS_MAX_PER_CELL", defaultMaxPerCell),
 		readIntEnv("PROCESS_MAX_OUTPUT_BYTES", defaultMaxOutputBytes),
 	)
+	pool.grants = env.PlacementGrants
 	if len(pool.allowBins) == 0 {
 		logger.Error("spawn.process: PROCESS_ALLOW_BINS is empty — all commands will be denied")
 	}
@@ -567,8 +612,21 @@ func readIntEnv(name string, def int) int {
 
 func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	cellID := ""
+	var policy *scopedProcessPolicy
 	if cell != nil {
 		cellID = cell.Name()
+		if pool.grants != nil {
+			scope, err := ext.ValidatedScopeOf(cell)
+			if err != nil {
+				return err
+			}
+			p, err := resolveScopedProcessPolicy(pool.grants, scope)
+			if err != nil {
+				return err
+			}
+			policy = p
+			cellID = scope.RoutingID()
+		}
 	}
 
 	b.NewFunctionBuilder().WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
@@ -583,7 +641,7 @@ func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 		if err := msgpack.Unmarshal(data, &req); err != nil {
 			return codeMsgpackDecode
 		}
-		id, code := pool.submit(cellID, req)
+		id, code := pool.submitPolicy(cellID, req, policy)
 		if code != codeOK {
 			return code
 		}
@@ -612,7 +670,10 @@ func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			// Alloc failed; leave result in map so the cell can retry.
 			return status
 		}
-		ptr := uint32(res[0])
+		ptr, ok := wasmUint32(res[0])
+		if !ok || uint64(len(data)) > uint64(^uint32(0)) {
+			return status
+		}
 		if ptr == 0 || !m.Memory().Write(ptr, data) {
 			// Write failed; leave result in map so the cell can retry.
 			return status
@@ -620,7 +681,7 @@ func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 		// Write succeeded — now safe to consume the result.
 		pool.consume(taskID)
 		m.Memory().WriteUint32Le(outPtrOut, ptr)
-		m.Memory().WriteUint32Le(outLenOut, uint32(len(data)))
+		m.Memory().WriteUint32Le(outLenOut, uint32(len(data))) // #nosec G115 -- bounded above.
 		return status
 	}).Export("process_result")
 
@@ -633,6 +694,13 @@ func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	}).Export("process_pending")
 
 	return nil
+}
+
+func wasmUint32(value uint64) (uint32, bool) {
+	if value > uint64(^uint32(0)) {
+		return 0, false
+	}
+	return uint32(value), true
 }
 
 func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {

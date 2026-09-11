@@ -3,12 +3,35 @@ package processext
 import (
 	"context"
 	"log/slog"
+	"os"
 	"os/exec"
 	"testing"
 	"time"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
+
+func TestProcessTimeoutPreservesDeadlineCause(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newProcPool(slog.Default(), 1, 1, 1, defaultMaxOutputBytes)
+	result := p.runCommand(context.Background(), runRequest{
+		Argv: []string{exe, "-test.run=TestProcessTimeoutHelper"},
+		Env:  map[string]string{"PULP_PROCESS_TIMEOUT_HELPER": "1"}, TimeoutMs: 20,
+	})
+	if result.Error != context.DeadlineExceeded.Error() {
+		t.Fatalf("error = %q, want deadline cause (exit=%d)", result.Error, result.ExitCode)
+	}
+}
+
+func TestProcessTimeoutHelper(t *testing.T) {
+	if os.Getenv("PULP_PROCESS_TIMEOUT_HELPER") != "1" {
+		return
+	}
+	time.Sleep(10 * time.Second)
+}
 
 // TestPool_RunsAllowedCommand drives the real exec path (not just the guard):
 // submit an allowlisted command, poll to completion, decode the result. Uses
